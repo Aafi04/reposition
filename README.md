@@ -53,8 +53,8 @@ Reposition runs an 8-agent pipeline orchestrated by **LangGraph** with full chec
 
 ```
                           ┌─────────────────────────────────┐
-                          │         Parallel Analyzers       │
-                          │  Security · Refactor · Coverage  │
+                          │         Parallel Analyzers      │
+                          │  Security · Refactor · Coverage │
                           └─────────────────────────────────┘
                                           │
  Scanner ──► Analyzers ──► Planner ──► Coder ──► Validator ──► PR Agent
@@ -116,7 +116,7 @@ The setup wizard will:
 - Print the Reposition logo
 - Let you choose a provider (Gemini, OpenAI, Anthropic, or Groq)
 - Show the exact key URL for your chosen provider
-- Prompt for provider key, E2B key, GitHub token, and target `owner/repo`
+- Prompt for provider key, [E2B key](https://e2b.dev/dashboard), [GitHub token](https://github.com/settings/tokens), and target `owner/repo`
 - Create or update `.env` without overwriting unrelated keys
 - Automatically run `python scripts/test_provider.py` to verify everything
 
@@ -345,6 +345,6 @@ python scripts/test_provider.py
 
 Built with [LangGraph](https://langchain-ai.github.io/langgraph/) · [E2B](https://e2b.dev) · [Anthropic](https://anthropic.com) · [PyGithub](https://pygithub.readthedocs.io) · and with love hehe
 
-**[⭐ Star this repo](https://github.com/Aafi04/reposition)** if Reposition saved you time.
+⭐ **[Star this repo](https://github.com/Aafi04/reposition)** if Reposition saved you time.
 
 </div>
