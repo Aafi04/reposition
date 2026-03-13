@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reposition"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-anthropic>=0.3.0",
+    "anthropic>=0.40.0",
+    "e2b-code-interpreter>=0.4.0",
+    "PyGithub>=2.3.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0",
+    "aiohttp>=3.9.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+    "tree-sitter-javascript>=0.23.0",
+    "gitpython>=3.1.40",
+    "click>=8.1.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+# Only the chosen provider's package needs to be installed.
+[project.optional-dependencies]
+openai = ["openai>=1.30.0", "langchain-openai>=0.1.0"]
+gemini = ["langchain-google-genai>=1.0.0"]
+groq = ["langchain-groq>=0.1.0"]
+anthropic = ["langchain-anthropic>=0.3.0"]
+
+[project.scripts]
+reposition = "reposition.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["reposition*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["tests/fixtures"]
