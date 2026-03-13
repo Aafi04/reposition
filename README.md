@@ -81,89 +81,44 @@ Priority order is always: `CRITICAL_SECURITY → HIGH_SECURITY → BUILD_RUNTIME
 
 ## Quickstart
 
-### Prerequisites
-
-- Python 3.11+
-- An API key for any one of: Anthropic, OpenAI, Gemini, or Groq
-- An E2B API key (free tier available)
-- A GitHub personal access token with `repo` scope
-
-### 1. Clone and install
+#### macOS / Linux
 
 ```bash
 git clone https://github.com/Aafi04/reposition
 cd reposition
 pip install -e .
-```
-
-**Windows users:** If `reposition` is not recognised after install, activate your venv first:
-
-```powershell
-.venv\Scripts\Activate.ps1
-reposition --help
-```
-
-Or use the included launcher: `.\reposition.bat run <repo_url>`
-
-### 2. Run one-time setup
-
-```bash
 reposition setup
 ```
 
-The setup wizard will:
+`pip install -e .` installs Reposition and all provider SDK dependencies up front.
 
-- Print the Reposition logo
-- Let you choose a provider (Gemini, OpenAI, Anthropic, or Groq)
-- Show the exact key URL for your chosen provider
-- Prompt for provider key, [E2B key](https://e2b.dev/dashboard), [GitHub token](https://github.com/settings/tokens), and target `owner/repo`
-- Create or update `.env` without overwriting unrelated keys
-- Automatically run `python scripts/test_provider.py` to verify everything
+#### Windows
 
-### 3. Run
+```powershell
+git clone https://github.com/Aafi04/reposition
+cd reposition
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .
+reposition setup
+```
 
-```bash
-# Preview what Reposition plans to change (no code written, ~3-5 min)
-reposition run https://github.com/you/your-repo --dry-run
+After activating the venv, all reposition commands
+work normally:
 
-# Full run — scans, fixes, validates, opens PR (~8-14 min)
-reposition run https://github.com/you/your-repo
-
-# Resume an interrupted run from the last checkpoint
-reposition resume <run_id>
-
-# Check the status of any run
+```powershell
+reposition run <url> --dry-run
+reposition run <url>
 reposition status <run_id>
 ```
 
-### Optional: manual configuration
-
-If you prefer not to use the wizard, configure `.env` directly:
+If you prefer not to use a venv, this also works
+on any platform:
 
 ```bash
-cp .env.example .env
-python scripts/test_provider.py
+python -m reposition setup
+python -m reposition run <url> --dry-run
 ```
-
-Then fill in:
-
-```env
-# Choose your LLM provider
-REPOSITION_LLM_PROVIDER=gemini        # anthropic | openai | gemini | groq
-
-# API key for your chosen provider (only one required)
-ANTHROPIC_API_KEY=                    # console.anthropic.com
-OPENAI_API_KEY=                       # platform.openai.com/api-keys
-GEMINI_API_KEY=                       # aistudio.google.com/app/apikey
-GROQ_API_KEY=                         # console.groq.com/keys
-
-# Required for all runs
-E2B_API_KEY=                          # e2b.dev/dashboard  (free tier)
-GITHUB_TOKEN=                         # github.com/settings/tokens  (repo scope)
-GITHUB_REPO=owner/repo                # the repo Reposition will open PRs on
-```
-
-> **Tip:** Always run `--dry-run` first. It shows exactly what work packages Reposition plans to execute and in what priority order, with no changes made to your repo.
 
 ---
 

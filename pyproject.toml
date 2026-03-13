@@ -8,7 +8,11 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.2.0",
+    "langgraph-checkpoint-sqlite>=3.0.0",
     "langchain-anthropic>=0.3.0",
+    "langchain-google-genai>=1.0.0",
+    "langchain-openai>=0.1.0",
+    "langchain-groq>=0.1.0",
     "anthropic>=0.40.0",
     "e2b-code-interpreter>=0.4.0",
     "PyGithub>=2.3.0",
@@ -33,6 +37,9 @@ anthropic = ["langchain-anthropic>=0.3.0"]
 
 [project.scripts]
 reposition = "reposition.cli:cli"
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["reposition*"]
