@@ -12,7 +12,7 @@ from reposition.llm_client import call_llm, get_llm
 from reposition.observability.tracer import RunTracer
 from reposition.sandbox import E2BSandboxManager
 from reposition.state import RepositionState
-from reposition.tools.github_tools import GitHubClient
+from reposition.tools.github_tools import GitHubClient, normalize_repo
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL)
 
@@ -58,7 +58,9 @@ async def pr_agent(state: RepositionState) -> dict:
     branch_name = f"reposition/{int(time.time())}-{state['run_id'][:8]}"
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
-    github_repo = os.environ.get("GITHUB_REPO", "")
+    github_repo = os.environ.get("GITHUB_REPO", "") or os.environ.get("GITHUB_PR_REPO", "") or cfg.github.pr_repo
+    if github_repo:
+        github_repo = normalize_repo(github_repo)["owner_repo"]
     gh = GitHubClient(github_token=github_token, repo_full_name=github_repo)
 
     existing = gh.find_existing_reposition_pr()

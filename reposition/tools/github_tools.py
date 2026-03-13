@@ -3,12 +3,70 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
 from github import Github, GithubException, InputGitTreeElement, RateLimitExceededException
 
 from reposition.sandbox import E2BSandboxManager
+
+_HTTPS_PREFIX = "https://github.com/"
+_SSH_PREFIX = "git@github.com:"
+_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def normalize_repo(input_str: str) -> dict[str, str]:
+    """Normalize GitHub repository input to canonical forms.
+
+    Supported inputs:
+    - https://github.com/owner/repo
+    - https://github.com/owner/repo.git
+    - git@github.com:owner/repo.git
+    - owner/repo
+    """
+    raw = (input_str or "").strip()
+    if not raw:
+        raise ValueError(
+            "Cannot parse repo: empty value.\n"
+            "Expected formats:\n"
+            "  https://github.com/owner/repo\n"
+            "  git@github.com:owner/repo.git\n"
+            "  owner/repo"
+        )
+
+    s = raw.rstrip("/")
+    if s.endswith(".git"):
+        s = s[:-4]
+
+    if s.startswith(_HTTPS_PREFIX):
+        owner_repo = s[len(_HTTPS_PREFIX):]
+    elif s.startswith(_SSH_PREFIX):
+        owner_repo = s[len(_SSH_PREFIX):]
+    elif "/" in s and not s.startswith("http") and "\\" not in s:
+        owner_repo = s
+    else:
+        raise ValueError(
+            f"Cannot parse repo: '{input_str}'\n"
+            "Expected formats:\n"
+            "  https://github.com/owner/repo\n"
+            "  git@github.com:owner/repo.git\n"
+            "  owner/repo"
+        )
+
+    if not _OWNER_REPO_RE.fullmatch(owner_repo):
+        raise ValueError(
+            f"Invalid repo format: '{input_str}'\n"
+            "Expected: owner/repo"
+        )
+
+    owner, repo = owner_repo.split("/", 1)
+    return {
+        "owner_repo": owner_repo,
+        "clone_url": f"https://github.com/{owner_repo}",
+        "owner": owner,
+        "repo": repo,
+    }
 
 
 class GitHubClient:
@@ -28,8 +86,13 @@ class GitHubClient:
             raise ValueError(
                 "GitHub token is required. Pass github_token or set GITHUB_TOKEN."
             )
+
+        resolved_repo = repo_full_name or os.environ.get("GITHUB_REPO", "") or os.environ.get("GITHUB_PR_REPO", "")
+        if resolved_repo:
+            resolved_repo = normalize_repo(resolved_repo)["owner_repo"]
+
         self._gh = Github(token)
-        self._repo = self._gh.get_repo(repo_full_name) if repo_full_name else None
+        self._repo = self._gh.get_repo(resolved_repo) if resolved_repo else None
 
     # ------------------------------------------------------------------
     # Backoff helper

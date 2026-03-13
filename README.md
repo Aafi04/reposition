@@ -107,17 +107,36 @@ After activating the venv, all reposition commands
 work normally:
 
 ```powershell
-reposition run <url> --dry-run
-reposition run <url>
+reposition run https://github.com/owner/repo --dry-run
+reposition run https://github.com/owner/repo
+reposition run https://github.com/owner/repo --pr-repo you/fork
 reposition status <run_id>
 ```
+
+| Setting        | Purpose                                                      |
+| -------------- | ------------------------------------------------------------ |
+| GITHUB_TOKEN   | GitHub personal access token (repo scope)                    |
+| --pr-repo flag | (Optional) Repo to open PRs on - defaults to analysis target |
 
 If you prefer not to use a venv, this also works
 on any platform:
 
 ```bash
 python -m reposition setup
-python -m reposition run <url> --dry-run
+python -m reposition run https://github.com/owner/repo --dry-run
+```
+
+Run examples:
+
+```bash
+# Analyze any repo
+reposition run https://github.com/owner/repo --dry-run
+
+# Full run — opens PR on the target repo
+reposition run https://github.com/owner/repo
+
+# Open PR on your fork instead
+reposition run https://github.com/owner/repo --pr-repo you/fork
 ```
 
 ---

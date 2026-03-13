@@ -540,15 +540,20 @@ def cli() -> None:
 
 
 @cli.command()
-@click.argument("repo_path")
-@click.option("--config", "config_path", default=None, help="Path to config YAML.")
+@click.argument("repo", required=False)
 @click.option("--dry-run", is_flag=True, help="Run Scanner + Analyzers + Planner only.")
+@click.option("--config", "config_path", default=None, help="Path to config YAML.")
 @click.option(
     "--clone-dir",
     default=None,
     help="Where to clone the repo (default: ~/.reposition/repos/).",
 )
-def run(repo_path: str, config_path: str | None, dry_run: bool, clone_dir: str | None) -> None:
+@click.option(
+    "--pr-repo",
+    default=None,
+    help="Open PR on this repo instead of the analysis target.",
+)
+def run(repo: str | None, dry_run: bool, config_path: str | None, clone_dir: str | None, pr_repo: str | None) -> None:
     """Run the Reposition pipeline on a repository."""
     if config_path:
         from reposition.config import load_config
@@ -558,13 +563,59 @@ def run(repo_path: str, config_path: str | None, dry_run: bool, clone_dir: str |
 
     from reposition.config import get_config
     from reposition.graph import resolve_repo_path
+    from reposition.tools.github_tools import normalize_repo
 
     cfg = get_config()
     default_clone_root = cfg.github.clone_dir
 
+    normalized_analysis_repo: dict[str, str] | None = None
+    if repo:
+        try:
+            normalized_analysis_repo = normalize_repo(repo)
+        except ValueError as exc:
+            local_repo_path = Path(repo).expanduser()
+            if local_repo_path.exists():
+                normalized_analysis_repo = None
+            else:
+                console.print(f"[red]{exc}[/red]")
+                raise SystemExit(1)
+    else:
+        configured_default_target = cfg.github.pr_repo.strip()
+        if configured_default_target:
+            try:
+                normalized_analysis_repo = normalize_repo(configured_default_target)
+            except ValueError as exc:
+                console.print(f"[red]Invalid configured default repo:[/red] {exc}")
+                raise SystemExit(1)
+            console.print(f"[dim]Analyzing {normalized_analysis_repo['clone_url']}[/dim]")
+        else:
+            console.print("[red]No repo specified.[/red]")
+            console.print("Usage: reposition run <repo>")
+            console.print("   or: reposition run https://github.com/owner/repo")
+            raise SystemExit(1)
+
+    if normalized_analysis_repo is not None:
+        analysis_repo_input = normalized_analysis_repo["clone_url"]
+    else:
+        assert repo is not None
+        analysis_repo_input = repo
+
+    chosen_pr_repo_input = pr_repo or cfg.github.pr_repo.strip() or (
+        normalized_analysis_repo["owner_repo"] if normalized_analysis_repo else ""
+    )
+
+    if chosen_pr_repo_input:
+        try:
+            normalized_pr_repo = normalize_repo(chosen_pr_repo_input)
+        except ValueError as exc:
+            console.print(f"[red]Invalid PR target repo:[/red] {exc}")
+            raise SystemExit(1)
+        os.environ["GITHUB_REPO"] = normalized_pr_repo["owner_repo"]
+        os.environ["GITHUB_PR_REPO"] = normalized_pr_repo["owner_repo"]
+
     try:
         resolved_repo_path = resolve_repo_path(
-            repo_path=repo_path,
+            repo_path=analysis_repo_input,
             clone_dir=clone_dir,
             default_clone_root=default_clone_root,
         )
@@ -572,7 +623,7 @@ def run(repo_path: str, config_path: str | None, dry_run: bool, clone_dir: str |
         console.print(f"[red]Repository resolution error:[/red] {exc}")
         raise SystemExit(1)
 
-    if repo_path.startswith("https://github.com/") or repo_path.startswith("git@github.com:"):
+    if normalized_analysis_repo is not None:
         console.print(f"[bold]Clone destination:[/bold] {resolved_repo_path}")
 
     if not _ensure_provider_dependency(cfg.llm.provider):
@@ -641,14 +692,12 @@ def setup() -> None:
         "Paste your GitHub token (github.com/settings/tokens, repo scope): ",
         visible=show_values,
     )
-    github_repo = input("GitHub repo for PRs (format: owner/repo): ").strip()
 
     env_contents = (
         f"REPOSITION_LLM_PROVIDER={provider_slug}\n"
         f"{provider_env_key}={llm_api_key}\n"
         f"E2B_API_KEY={e2b_api_key}\n"
         f"GITHUB_TOKEN={github_token}\n"
-        f"GITHUB_REPO={github_repo}\n"
     )
     env_path.write_text(env_contents, encoding="utf-8")
 
@@ -656,7 +705,6 @@ def setup() -> None:
     os.environ[provider_env_key] = llm_api_key
     os.environ["E2B_API_KEY"] = e2b_api_key
     os.environ["GITHUB_TOKEN"] = github_token
-    os.environ["GITHUB_REPO"] = github_repo
 
     if not _ensure_provider_dependency(provider_slug):
         print("")
@@ -678,13 +726,13 @@ def setup() -> None:
 
     if all_passed:
         print("")
-        print("[OK] Setup complete. You are ready to run Reposition.")
+        print("[OK] Setup complete.")
         print("")
-        print("Try a dry run first (no code changes, ~3-5 min):")
-        print("  reposition run <your-repo-url> --dry-run")
+        print("Run your first analysis:")
+        print("  reposition run https://github.com/you/your-repo --dry-run")
         print("")
-        print("Or on Windows if reposition is not in PATH yet:")
-        print("  python -m reposition run <your-repo-url> --dry-run")
+        print("To open PRs on a fork instead of the target repo:")
+        print("  reposition run https://github.com/someone/repo --pr-repo you/your-fork")
         return
 
     print("")

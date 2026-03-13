@@ -56,6 +56,7 @@ class PrAgentConfig:
 class GithubConfig:
     base_branch: str = "main"
     clone_dir: str = "~/.reposition/repos"
+    pr_repo: str = ""
 
 
 @dataclass
@@ -167,6 +168,13 @@ def load_config(path: str | None = None) -> Config:
 
     cfg = Config(**sections)
     _apply_env_overrides(cfg)
+
+    # Standard environment variable for optional PR target repository.
+    # Supports backward compatibility with older naming.
+    env_pr_repo = os.environ.get("GITHUB_PR_REPO", "").strip() or os.environ.get("GITHUB_REPO", "").strip()
+    if env_pr_repo:
+        cfg.github.pr_repo = env_pr_repo
+
     return cfg
 
 

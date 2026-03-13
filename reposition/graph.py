@@ -23,19 +23,19 @@ from reposition.config import get_config
 from reposition.observability.tracer import RunTracer
 from reposition.sandbox import E2BSandboxManager
 from reposition.state import RepositionState, make_initial_state
+from reposition.tools.github_tools import normalize_repo
 
 
 def _is_github_url(repo_path: str) -> bool:
-    return repo_path.startswith("https://github.com/") or repo_path.startswith("git@github.com:")
+    try:
+        normalize_repo(repo_path)
+        return True
+    except ValueError:
+        return False
 
 
 def _repo_name_from_url(url: str) -> str:
-    candidate = url.rstrip("/").split("/")[-1]
-    if ":" in candidate:
-        candidate = candidate.split(":")[-1]
-    if candidate.endswith(".git"):
-        candidate = candidate[:-4]
-    return candidate
+    return normalize_repo(url)["repo"]
 
 
 def resolve_repo_path(
@@ -47,10 +47,13 @@ def resolve_repo_path(
     if not _is_github_url(repo_path):
         return str(Path(repo_path).expanduser().resolve())
 
+    normalized = normalize_repo(repo_path)
+    clone_url = normalized["clone_url"]
+
     if clone_dir:
         destination = Path(clone_dir).expanduser()
     else:
-        destination = Path(default_clone_root).expanduser() / _repo_name_from_url(repo_path)
+        destination = Path(default_clone_root).expanduser() / _repo_name_from_url(clone_url)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -65,7 +68,7 @@ def resolve_repo_path(
             repo = Repo(str(destination))
             repo.remotes.origin.pull()
         else:
-            Repo.clone_from(repo_path, str(destination))
+            Repo.clone_from(clone_url, str(destination))
     except InvalidGitRepositoryError as exc:
         raise RuntimeError(
             f"Destination exists but is not a git repo: {destination}. "
@@ -76,14 +79,14 @@ def resolve_repo_path(
         lower = msg.lower()
         if "repository not found" in lower or "not found" in lower:
             raise RuntimeError(
-                f"Repository not found: {repo_path}. Verify the URL and try again."
+                f"Repository not found: {clone_url}. Verify the URL and try again."
             ) from exc
         if "permission denied" in lower or "authentication failed" in lower or "access denied" in lower:
             raise RuntimeError(
                 "No permission to clone/pull this repository. "
                 "If it is private, verify your credentials and that GITHUB_TOKEN has access."
             ) from exc
-        raise RuntimeError(f"Git operation failed for {repo_path}: {msg}") from exc
+        raise RuntimeError(f"Git operation failed for {clone_url}: {msg}") from exc
 
     return str(destination.resolve())
 
