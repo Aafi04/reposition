@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import subprocess
 import sys
 import time
 import traceback
@@ -55,6 +57,39 @@ _ANALYZER_NAMES = {
 
 _STATS_ORDER = ["Scanner", "Security", "Refactor", "Coverage", "Planner", "Coder", "Validator", "PR Agent"]
 
+_PROVIDER_OPTIONS: dict[int, dict[str, str]] = {
+    1: {
+        "name": "Gemini",
+        "slug": "gemini",
+        "env_key": "GEMINI_API_KEY",
+        "url": "https://aistudio.google.com/app/apikey",
+        "label": "Gemini (free tier available - recommended)",
+    },
+    2: {
+        "name": "OpenAI",
+        "slug": "openai",
+        "env_key": "OPENAI_API_KEY",
+        "url": "https://platform.openai.com/api-keys",
+        "label": "OpenAI",
+    },
+    3: {
+        "name": "Anthropic",
+        "slug": "anthropic",
+        "env_key": "ANTHROPIC_API_KEY",
+        "url": "https://console.anthropic.com/settings/keys",
+        "label": "Anthropic",
+    },
+    4: {
+        "name": "Groq",
+        "slug": "groq",
+        "env_key": "GROQ_API_KEY",
+        "url": "https://console.groq.com/keys",
+        "label": "Groq (fastest, free tier)",
+    },
+}
+
+_ENV_KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
 
 def _new_display_state(dry_run: bool) -> dict[str, Any]:
     now = time.monotonic()
@@ -69,6 +104,43 @@ def _new_display_state(dry_run: bool) -> dict[str, Any]:
         "summary_ready": False,
         "summary_lines": [],
     }
+
+
+def _dotenv_quote(value: str) -> str:
+    """Return a .env-safe value while keeping simple values unquoted."""
+    if value == "":
+        return '""'
+    if re.fullmatch(r"[A-Za-z0-9_./:@-]+", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _upsert_env_values(env_path: Path, updates: dict[str, str]) -> None:
+    """Create or update keys in .env without touching unrelated entries."""
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    written: set[str] = set()
+    output: list[str] = []
+
+    for line in lines:
+        match = _ENV_KEY_RE.match(line)
+        if not match:
+            output.append(line)
+            continue
+
+        key = match.group(1)
+        if key in updates:
+            output.append(f"{key}={_dotenv_quote(updates[key])}")
+            written.add(key)
+        else:
+            output.append(line)
+
+    for key, value in updates.items():
+        if key not in written:
+            output.append(f"{key}={_dotenv_quote(value)}")
+
+    content = "\n".join(output).rstrip()
+    env_path.write_text(f"{content}\n" if content else "", encoding="utf-8")
 
 
 def _set_stage_status(display_state: dict[str, Any], stage: str, status: str, retry: int = 0) -> None:
@@ -507,6 +579,56 @@ def run(repo_path: str, config_path: str | None, dry_run: bool, clone_dir: str |
             asyncio.run(_run_full(resolved_repo_path))
         except KeyboardInterrupt:
             console.print("Run interrupted")
+
+
+@cli.command()
+def setup() -> None:
+    """Run an interactive one-time setup wizard."""
+    console.print("\n[bold]Which LLM provider do you want to use?[/bold]")
+    for idx in sorted(_PROVIDER_OPTIONS):
+        console.print(f"{idx}. {_PROVIDER_OPTIONS[idx]['label']}")
+
+    provider_choice = click.prompt("Select provider", type=click.IntRange(1, 4))
+    provider_info = _PROVIDER_OPTIONS[provider_choice]
+
+    console.print(f"\nGet your {provider_info['name']} API key: {provider_info['url']}")
+    llm_api_key = click.prompt("Paste your API key", type=str, hide_input=True).strip()
+
+    e2b_api_key = click.prompt("Paste your E2B API key (e2b.dev/dashboard)", type=str, hide_input=True).strip()
+    github_token = click.prompt(
+        "Paste your GitHub token (github.com/settings/tokens, repo scope)",
+        type=str,
+        hide_input=True,
+    ).strip()
+    github_repo = click.prompt("GitHub repo to open PRs on (owner/repo)", type=str).strip()
+
+    env_updates = {
+        "REPOSITION_LLM_PROVIDER": provider_info["slug"],
+        provider_info["env_key"]: llm_api_key,
+        "E2B_API_KEY": e2b_api_key,
+        "GITHUB_TOKEN": github_token,
+        "GITHUB_REPO": github_repo,
+    }
+
+    project_root = Path(__file__).resolve().parent
+    env_path = project_root / ".env"
+    _upsert_env_values(env_path, env_updates)
+    console.print(f"\n[green]Saved configuration to {env_path}[/green]")
+
+    console.print("\n[bold]Running provider compatibility check...[/bold]")
+    script_path = project_root / "scripts" / "test_provider.py"
+    result = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=str(project_root),
+        check=False,
+    )
+
+    if result.returncode != 0:
+        console.print("\n[red]Setup saved, but provider verification failed.[/red]")
+        raise SystemExit(result.returncode)
+
+    console.print("\nSetup complete. Run your first analysis:")
+    console.print("  reposition run <your-repo-url> --dry-run")
 
 
 async def _run_full(repo_path: str) -> None:
