@@ -668,9 +668,13 @@ def setup() -> None:
     print("Verifying configuration...")
     print("")
 
-    from scripts.test_provider import run_provider_checks
-
-    all_passed = run_provider_checks(provider_slug, emit=print, include_check5=False)
+    check_script = project_root / "scripts" / "test_provider.py"
+    result = subprocess.run(
+        [sys.executable, str(check_script), "--provider", provider_slug],
+        cwd=str(project_root),
+        check=False,
+    )
+    all_passed = result.returncode == 0
 
     if all_passed:
         print("")
