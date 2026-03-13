@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 
 _DEFAULT_CONFIG_FILENAME = "reposition.config.yaml"
 
@@ -145,7 +146,13 @@ def load_config(path: str | None = None) -> Config:
         A fully-populated configuration dataclass.
     """
     raw: dict[str, Any] = {}
-    config_path = Path(path) if path else Path.cwd() / _DEFAULT_CONFIG_FILENAME
+    config_path = Path(path).resolve() if path else (Path.cwd() / _DEFAULT_CONFIG_FILENAME)
+
+    # Always hydrate process env from a .env file before applying REPOSITION_* overrides.
+    # When a config path is supplied, prefer a sibling .env next to that config.
+    dotenv_path = config_path.parent / ".env" if path else (Path.cwd() / ".env")
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+
     if config_path.is_file():
         with open(config_path, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
