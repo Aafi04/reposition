@@ -82,6 +82,7 @@ Priority order is always: `CRITICAL_SECURITY → HIGH_SECURITY → BUILD_RUNTIME
 ## Quickstart
 
 ### macOS and Linux
+
 ```bash
 git clone https://github.com/Aafi04/reposition
 cd reposition
@@ -97,11 +98,14 @@ reposition run https://github.com/you/your-repo --dry-run
 > Then retry from `python3 -m venv .venv`.
 
 ### Windows
+
 ```powershell
 git clone https://github.com/Aafi04/reposition
 cd reposition
 python -m venv .venv
+Start-Sleep -Seconds 2
 .venv\Scripts\activate
+Start-Sleep -Seconds 2
 pip install -e .
 reposition setup
 reposition run https://github.com/you/your-repo --dry-run
@@ -127,16 +131,17 @@ After setup, you never need to touch a config file.
 
 ### Getting your keys
 
-| Key | Where to get it | Free tier? |
-|-----|----------------|------------|
-| LLM API key | Depends on provider — setup tells you the URL | Gemini yes, Groq yes |
-| E2B_API_KEY | [e2b.dev/dashboard](https://e2b.dev/dashboard) | Yes |
-| GITHUB_TOKEN | [github.com/settings/tokens](https://github.com/settings/tokens) (repo scope) | Yes |
+| Key          | Where to get it                                                               | Free tier?           |
+| ------------ | ----------------------------------------------------------------------------- | -------------------- |
+| LLM API key  | Depends on provider — setup tells you the URL                                 | Gemini yes, Groq yes |
+| E2B_API_KEY  | [e2b.dev/dashboard](https://e2b.dev/dashboard)                                | Yes                  |
+| GITHUB_TOKEN | [github.com/settings/tokens](https://github.com/settings/tokens) (repo scope) | Yes                  |
 
 You only need **one** LLM API key — whichever
 provider you choose during setup.
 
 ### Running Reposition
+
 ```bash
 # Preview what will change — no code written (~3-5 min)
 reposition run https://github.com/you/your-repo --dry-run
