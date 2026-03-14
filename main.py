@@ -483,14 +483,27 @@ async def _run_with_live(stream, max_retries: int, dry_run: bool = False) -> dic
         finally:
             done.set()
 
+    async def _force_refresh(live: Live, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            live.update(_build_renderables(display_state))
+            await asyncio.sleep(1.0)
+
     consumer = asyncio.create_task(_consume_stream())
 
+    stop_refresh = asyncio.Event()
     with Live(_build_renderables(display_state), console=console, refresh_per_second=2) as live:
-        while not done.is_set():
-            live.update(_build_renderables(display_state))
-            await asyncio.sleep(0.5)
+        refresh_task = asyncio.create_task(_force_refresh(live, stop_refresh))
+        try:
+            await done.wait()
+        finally:
+            stop_refresh.set()
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except asyncio.CancelledError:
+                pass
 
-        await consumer
+    await consumer
 
     if interrupted:
         aclose = getattr(stream, "aclose", None)
