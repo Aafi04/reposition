@@ -19,7 +19,7 @@ Point it at any repo. Walk away. Come back to a pull request.
 [![License](https://img.shields.io/badge/License-MIT-22C55E?style=flat-square)](LICENSE)
 [![Works With](https://img.shields.io/badge/Works%20With-Anthropic%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20Groq-6366F1?style=flat-square)](#provider-compatibility)
 
-[**Demo**](https://asciinema.org/a/o1NHF2A60DV9JQYe) · [**Quickstart**](#quickstart) · [**How It Works**](#how-it-works) · [**Configuration**](#configuration)
+[**Demo**](https://drive.google.com/file/d/1X_YMakt45OIlVOpMyTuDFWhTYuTWUwwq/view?usp=sharing) · [**Quickstart**](#quickstart) · [**How It Works**](#how-it-works) · [**Configuration**](#configuration)
 
 </div>
 
