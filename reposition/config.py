@@ -95,6 +95,18 @@ _SECTION_TYPES: dict[str, type] = {
 }
 
 
+def get_config_dir() -> Path:
+    """Return the canonical user-level config directory (~/.reposition)."""
+    config_dir = Path.home() / ".reposition"
+    config_dir.mkdir(exist_ok=True)
+    return config_dir
+
+
+def get_env_path() -> Path:
+    """Return the path to the user-level .env file."""
+    return get_config_dir() / ".env"
+
+
 def _coerce(value: str, target_type: type) -> Any:
     """Coerce a string env-var value to the target field type."""
     if target_type is bool:
@@ -149,10 +161,10 @@ def load_config(path: str | None = None) -> Config:
     raw: dict[str, Any] = {}
     config_path = Path(path).resolve() if path else (Path.cwd() / _DEFAULT_CONFIG_FILENAME)
 
-    # Always hydrate process env from a .env file before applying REPOSITION_* overrides.
-    # When a config path is supplied, prefer a sibling .env next to that config.
-    dotenv_path = config_path.parent / ".env" if path else (Path.cwd() / ".env")
-    load_dotenv(dotenv_path=dotenv_path, override=False)
+    # Always hydrate process env from the user-level .env first,
+    # then allow a local .env in the current working directory to override.
+    load_dotenv(get_env_path(), override=False)
+    load_dotenv(Path.cwd() / ".env", override=True)
 
     if config_path.is_file():
         with open(config_path, encoding="utf-8") as fh:

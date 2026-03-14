@@ -700,8 +700,10 @@ def run(repo: str | None, dry_run: bool, config_path: str | None, clone_dir: str
 @cli.command()
 def setup() -> None:
     """Run an interactive one-time setup wizard."""
+    from reposition.config import get_env_path
+
     project_root = Path(__file__).resolve().parent
-    env_path = project_root / ".env"
+    env_path = get_env_path()
 
     if _env_has_values(env_path):
         overwrite = input("A .env file already exists. Overwrite? [y/N]: ").strip().lower()
@@ -740,6 +742,7 @@ def setup() -> None:
         f"GITHUB_TOKEN={github_token}\n"
     )
     env_path.write_text(env_contents, encoding="utf-8")
+    console.print(f"[dim]Config saved to: {env_path}[/dim]")
 
     os.environ["REPOSITION_LLM_PROVIDER"] = provider_slug
     os.environ[provider_env_key] = llm_api_key
