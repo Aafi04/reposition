@@ -9,15 +9,16 @@ import importlib.util
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import signal
 from pathlib import Path
 from typing import Any
 
 import click
 from rich import box
 from rich.console import Console, Group
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -108,19 +109,115 @@ _PROVIDER_PACKAGE: dict[str, str] = {
 }
 
 
+class TerminalDisplay:
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._lock = threading.Lock()
+        self._rendered = False
+        self._line_count = 0
+        self._suppress_timer = False
+
+    def full_render(self, lines: list[str]) -> None:
+        """Full redraw on state changes only."""
+        with self._lock:
+            self._suppress_timer = True
+            try:
+                if self._rendered:
+                    sys.stdout.write(f"\033[{self._line_count}A\033[J")
+                    sys.stdout.flush()
+                for line in lines:
+                    self.console.print(line)
+                self._line_count = len(lines)
+                self._rendered = True
+            finally:
+                self._suppress_timer = False
+
+    def update_lines(self, updates: dict[int, str]) -> None:
+        """Update specific lines in place without full redraw."""
+        with self._lock:
+            if self._suppress_timer:
+                return
+            if not self._rendered:
+                return
+            for line_idx, content in updates.items():
+                # Move cursor to the target line from the bottom
+                lines_up = self._line_count - line_idx
+                if lines_up <= 0:
+                    continue
+                # Save/restore cursor around each in-place update to avoid drift.
+                # Drift causes right-edge corruption and partial clears on interrupt.
+                sys.stdout.write("\033[s")
+                sys.stdout.write(f"\033[{lines_up}A\033[2K\r")
+                self.console.print(content, end="")
+                sys.stdout.write("\033[u")
+                sys.stdout.flush()
+
+    def clear(self) -> None:
+        with self._lock:
+            if self._rendered:
+                sys.stdout.write(f"\033[{self._line_count}A\033[J")
+                sys.stdout.flush()
+                self._rendered = False
+                self._line_count = 0
+
+
 def _new_display_state(dry_run: bool) -> dict[str, Any]:
     now = time.monotonic()
-    return {
+    base = {
         "dry_run": dry_run,
+        "is_dry_run": dry_run,
         "start_time": now,
         "current_activity": "[cyan]>[/cyan] Scanner    Initializing pipeline...",
+        # nested structure used by existing helpers
         "stages": {name: {"status": "waiting", "retry": 0} for name in _STAGE_ORDER},
         "analyzer_statuses": {"security": "waiting", "refactor": "waiting", "coverage": "waiting"},
+        # stage_times keyed by stage_key (scanner, analyzers, ...)
         "stage_times": {name: {"start": None, "end": None} for name in _STAGE_ORDER},
         "stats": {agent: {"status": "-", "detail": "-"} for agent in _STATS_ORDER},
         "summary_ready": False,
         "summary_lines": [],
     }
+
+    # Flat keys used by table rendering and direct lookups
+    flat: dict[str, Any] = {
+        "current_activity": base["current_activity"],
+        "stage_scanner": "pending",
+        "stage_analyzers": "pending",
+        "stage_planner": "pending",
+        "stage_coder": "pending",
+        "stage_validator": "pending",
+        "stage_pr_agent": "pending",
+        "stage_times": {
+            "Scanner": {"start": None, "end": None},
+            "Analyzers": {"start": None, "end": None},
+            "Planner": {"start": None, "end": None},
+            "Coder": {"start": None, "end": None},
+            "Validator": {"start": None, "end": None},
+            "PR Agent": {"start": None, "end": None},
+        },
+        "scanner_status": "-",
+        "scanner_detail": "-",
+        "security_status": "-",
+        "security_detail": "-",
+        "refactor_status": "-",
+        "refactor_detail": "-",
+        "coverage_status": "-",
+        "coverage_detail": "-",
+        "planner_status": "-",
+        "planner_detail": "-",
+        "coder_status": "-",
+        "coder_detail": "-",
+        "validator_status": "-",
+        "validator_detail": "-",
+        "pr_agent_status": "-",
+        "pr_agent_detail": "-",
+    }
+
+    # Merge and return; keep nested base keys for compatibility
+    # Don't let flat stage_times overwrite nested stage_times used by helpers
+    flat.pop("stage_times", None)
+    base.update(flat)
+    return base
 
 
 def _env_has_values(env_path: Path) -> bool:
@@ -142,6 +239,19 @@ def _prompt_secret(prompt: str) -> str:
         retry = input("Press Enter to continue, or type r to re-enter: ").strip().lower()
         if retry != "r":
             return value
+
+
+def _handle_sigint(signum, frame):
+    """Called on Ctrl+C. Cancels the running asyncio tasks gracefully."""
+    try:
+        loop = asyncio.get_event_loop()
+    except Exception:
+        return
+    for task in asyncio.all_tasks(loop):
+        try:
+            task.cancel()
+        except Exception:
+            pass
 
 
 def _ensure_provider_dependency(provider_slug: str) -> bool:
@@ -287,6 +397,157 @@ def _build_renderables(display_state: dict[str, Any]) -> Group:
     return Group(*renderables)
 
 
+def _build_progress_line(display_state: dict[str, Any], now: float, width: int = 74) -> str:
+    stages = [
+        "Scanner",
+        "Analyzers",
+        "Planner",
+        "Coder",
+        "Validator",
+        "PR Agent",
+    ]
+    stage_parts: list[str] = []
+
+    stage_times: dict[str, dict[str, float | None]] = display_state.get("stage_times", {})
+
+    for stage_key in _STAGE_ORDER:
+        label = _STAGE_LABELS[stage_key]
+        status = display_state["stages"][stage_key]["status"]
+        # stage_times is keyed by stage_key in internal state
+        times = stage_times.get(stage_key, {})
+        start = times.get("start")
+        end = times.get("end")
+
+        if status == "complete" and start is not None and end is not None:
+            t = int(max(0, end - start))
+            m, sc = divmod(t, 60)
+            stage_parts.append(f"{label} {m}:{sc:02d}")
+        elif status in ("running", "retrying") and start is not None:
+            t = int(max(0, now - start))
+            m, sc = divmod(t, 60)
+            stage_parts.append(f"{label} {m}:{sc:02d}")
+        elif status == "failed" and start is not None and end is not None:
+            t = int(max(0, end - start))
+            m, sc = divmod(t, 60)
+            stage_parts.append(f"{label} {m}:{sc:02d}")
+        else:
+            stage_parts.append(label)
+
+    prog = " -> ".join(stage_parts)
+    inner_w = max(10, width - 4)
+    if len(prog) > inner_w:
+        prog = prog[: inner_w - 3] + "..."
+    else:
+        prog = f"{prog:<{inner_w}}"
+    return f"| {prog} |"
+
+
+def build_display_lines(
+    display_state: dict[str, Any],
+    pipeline_start_time: float,
+) -> dict:
+    """Return tabular layout lines and dynamic indices for the live display."""
+    now = time.monotonic()
+    elapsed = int(now - pipeline_start_time)
+    mins, secs = divmod(elapsed, 60)
+    elapsed_str = f"{mins}m {secs:02d}s"
+
+    W = 74  # total display width
+    border = "+" + "-" * (W - 2) + "+"
+
+    lines: list[str] = []
+
+    # Top border
+    lines.append(f"[dim]{border}[/dim]")  # line 0
+
+    # Activity + elapsed (strict fixed width to prevent right-edge wrap)
+    activity = str(display_state.get("current_activity", "Initializing..."))
+    try:
+        activity_plain = Text.from_markup(activity).plain
+    except Exception:
+        activity_plain = activity
+    right_text = f"Elapsed: {elapsed_str}"
+    inner_w = W - 4
+    left = f"> {activity_plain}"
+    max_left = max(4, inner_w - len(right_text) - 1)
+    if len(left) > max_left:
+        left = left[: max_left - 3] + "..."
+    spaces = max(1, inner_w - len(left) - len(right_text))
+    activity_line = f"| {left}{' ' * spaces}{right_text} |"
+    lines.append(activity_line)  # line 1
+
+    # Middle border
+    lines.append(f"[dim]{border}[/dim]")  # line 2
+
+    # Pipeline progress row
+    progress_line = _build_progress_line(display_state, now, width=W)
+    lines.append(progress_line)  # line 3
+
+    # Second border
+    lines.append(f"[dim]{border}[/dim]")  # line 4
+
+    # Table header (strict fixed widths)
+    agent_w = 16
+    status_w = 9
+    detail_w = max(8, (W - 4) - agent_w - status_w - 2)
+    lines.append(f"| {'Agent':<{agent_w}}{'Status':<{status_w}}  {'Detail':<{detail_w}} |")  # line 5
+    lines.append(f"| {'-'*agent_w}{'-'*status_w}  {'-'*detail_w} |")  # line 6
+
+    agents = [
+        "Scanner",
+        "Security",
+        "Refactor",
+        "Coverage",
+        "Planner",
+        "Coder",
+        "Validator",
+        "PR Agent",
+    ]
+    for agent in agents:
+        key = agent.lower().replace(" ", "_")
+        status = display_state.get(f"{key}_status", "-")
+        detail = display_state.get(f"{key}_detail", "-")
+        # Bug 3: PR Agent should not display in dry run
+        is_dry = display_state.get("is_dry_run", False)
+        if agent == "PR Agent" and is_dry:
+            status = "-"
+            detail = "N/A (dry run)"
+
+        max_detail = detail_w
+        if len(detail) > max_detail:
+            detail = detail[: max_detail - 3] + "..."
+        if status == "OK":
+            s_plain = "OK"
+            s_str = "[green]OK[/green]"
+        elif status == "RUNNING":
+            s_plain = "RUNNING"
+            s_str = "[yellow]RUNNING[/yellow]"
+        elif status == "FAIL":
+            s_plain = "FAIL"
+            s_str = "[red]FAIL[/red]"
+        else:
+            s_plain = "-"
+            s_str = "[dim]-[/dim]"
+        s_cell = f"{s_str}{' ' * max(0, status_w - len(s_plain))}"
+
+        # Bug 1: Add explicit space after status markup and avoid width padding on markup
+        lines.append(
+            f"| [bold]{agent:<{agent_w}}[/bold]"
+            f"{s_cell}  {detail:<{detail_w}} |"
+        )
+
+    # Bottom border
+    lines.append(f"[dim]{border}[/dim]")
+
+    return {
+        "lines": lines,
+        "dynamic": {
+            1: activity_line,
+            3: progress_line,
+        },
+    }
+
+
 def _status_from_analyzer(value: str) -> str:
     if value == "COMPLETE":
         return "OK"
@@ -339,127 +600,188 @@ def _apply_event_update(
     update: dict[str, Any],
     max_retries: int,
 ) -> None:
-    if node_name == "scanner":
+    # Map merged_state keys to flat display_state keys and keep existing nested state updated
+    now = time.monotonic()
+
+    # Scanner completed -> manifest present
+    if "manifest" in update:
+        manifest = update.get("manifest") or {}
+        files = manifest.get("files") or []
+        excluded = update.get("excluded_files", []) or []
+
+        display_state["scanner_status"] = "OK"
+        display_state["scanner_detail"] = f"{len(files)} files, {len(excluded)} secrets excluded"
+        display_state["stage_scanner"] = "complete"
+        # nested helpers
         _set_stage_status(display_state, "scanner", "complete")
+        # set nested end time
+        try:
+            display_state["stage_times"]["scanner"]["end"] = now
+        except Exception:
+            pass
+
+        # Start analyzers
+        display_state["stage_analyzers"] = "running"
         _set_stage_status(display_state, "analyzers", "running")
+        display_state["current_activity"] = "Analyzers running in parallel..."
+        # set running details
+        display_state["security_status"] = "RUNNING"
+        display_state["security_detail"] = "Analyzing authentication boundaries..."
+        display_state["refactor_status"] = "RUNNING"
+        display_state["refactor_detail"] = "Scanning for SRP violations..."
+        display_state["coverage_status"] = "RUNNING"
+        display_state["coverage_detail"] = "Checking uncovered execution paths..."
 
-        manifest = merged_state.get("manifest") or {}
-        total_files = manifest.get("total_files", 0)
-        excluded = len(merged_state.get("excluded_files", []))
-        _set_stat(display_state, "Scanner", "OK", f"{total_files} files, {excluded} secret excluded")
-        _set_activity(display_state, "Analyzers", "Running parallel analyzer calls...")
-        _set_stat(display_state, "Security", "RUNNING", "Analyzing authentication boundaries...")
-        _set_stat(display_state, "Refactor", "RUNNING", "Scanning for SRP violations...")
-        _set_stat(display_state, "Coverage", "RUNNING", "Checking uncovered execution paths...")
-        for key in ("security", "refactor", "coverage"):
-            display_state["analyzer_statuses"][key] = "running"
-        return
+    # Security report arrived
+    if "security_report" in update:
+        sec = update.get("security_report", []) or []
+        count = len(sec)
+        crits = sum(1 for x in sec if str(x.get("severity")).upper() == "CRITICAL")
+        highs = sum(1 for x in sec if str(x.get("severity")).upper() == "HIGH")
+        meds = sum(1 for x in sec if str(x.get("severity")).upper() == "MEDIUM")
+        lows = sum(1 for x in sec if str(x.get("severity")).upper() == "LOW")
+        parts = []
+        if crits:
+            parts.append(f"{crits} CRITICAL")
+        if highs:
+            parts.append(f"{highs} HIGH")
+        if meds:
+            parts.append(f"{meds} MEDIUM")
+        if lows:
+            parts.append(f"{lows} LOW")
+        detail = ", ".join(parts) if parts else "0 findings"
+        # Bug 2: always mark security as OK when report key is present
+        display_state["security_status"] = "OK"
+        display_state["security_detail"] = (f"{count} findings ({detail})" if count else "0 findings")
+        # mark analyzers running
+        display_state["stage_analyzers"] = display_state.get("stage_analyzers", "running")
 
-    if node_name == "analyzers":
+    # Refactor report
+    if "refactor_report" in update:
+        ref = update.get("refactor_report", []) or []
+        display_state["refactor_status"] = "OK"
+        display_state["refactor_detail"] = f"{len(ref)} findings"
+
+    # Coverage report
+    if "coverage_report" in update:
+        cov = update.get("coverage_report", []) or []
+        display_state["coverage_status"] = "OK"
+        display_state["coverage_detail"] = f"{len(cov)} uncovered paths"
+        # All analyzers done
+        display_state["stage_analyzers"] = "complete"
         _set_stage_status(display_state, "analyzers", "complete")
+        try:
+            display_state["stage_times"]["analyzers"]["end"] = now
+        except Exception:
+            pass
+        # Start planner
+        display_state["stage_planner"] = "running"
         _set_stage_status(display_state, "planner", "running")
+        display_state["current_activity"] = "Planner synthesizing work packages..."
 
-        statuses = merged_state.get("analyzer_statuses", {})
-        for key in ("security", "refactor", "coverage"):
-            display_state["analyzer_statuses"][key] = _status_from_analyzer(statuses.get(key, "COMPLETE"))
-
-        security_report = merged_state.get("security_report", [])
-        refactor_report = merged_state.get("refactor_report", [])
-        coverage_report = merged_state.get("coverage_report", [])
-
-        _set_stat(display_state, "Security", _status_from_analyzer(statuses.get("security", "COMPLETE")), _security_detail(security_report))
-        _set_stat(display_state, "Refactor", _status_from_analyzer(statuses.get("refactor", "COMPLETE")), f"{len(refactor_report)} findings")
-        _set_stat(display_state, "Coverage", _status_from_analyzer(statuses.get("coverage", "COMPLETE")), f"{len(coverage_report)} uncovered paths")
-        total_findings = len(security_report) + len(refactor_report) + len(coverage_report)
-        _set_activity(display_state, "Planner", f"Deduplicating {total_findings} findings into work packages...")
-        _set_stat(display_state, "Planner", "RUNNING", "Synthesizing work packages...")
-        return
-
-    if node_name == "planner":
+    # Work packages (planner complete)
+    if "work_packages" in update:
+        pkgs = update.get("work_packages", [])
+        if pkgs is None:
+            pkgs = []
+        # Bug 4: planner detail wording and fallback
+        display_state["planner_status"] = "OK"
+        if not pkgs:
+            planner_detail = "0 work packages planned"
+        else:
+            top_label = pkgs[0].get("priority_label", "")
+            if top_label:
+                planner_detail = (
+                    f"{len(pkgs)} work packages "
+                    f"({top_label} first)"
+                )
+            else:
+                planner_detail = f"{len(pkgs)} work packages"
+        display_state["planner_detail"] = planner_detail
+        display_state["stage_planner"] = "complete"
         _set_stage_status(display_state, "planner", "complete")
-        _set_stage_status(display_state, "coder", "running")
-
-        packages = merged_state.get("work_packages", [])
-        planned = len(packages)
-        top = packages[0].get("priority_label", "N/A") if packages else "N/A"
-        _set_stat(display_state, "Planner", "OK", f"{planned} work packages ({top} first)")
-        if planned:
-            first_file = (packages[0].get("files_to_modify") or ["-"])[0]
-            _set_activity(display_state, "Coder", f"Package 1/{planned} -- Patching {first_file}...")
-            _set_stat(display_state, "Coder", "RUNNING", f"Package 1/{planned} -- {first_file}")
-        return
-
-    if node_name == "coder":
-        total = len(merged_state.get("work_packages", []))
-        current = min(int(merged_state.get("current_package_index", 0)) + 1, max(total, 1))
-        current_pkg = None
-        packages = merged_state.get("work_packages", [])
-        idx = int(merged_state.get("current_package_index", 0))
-        if 0 <= idx < len(packages):
-            current_pkg = packages[idx]
-
-        first_file = (current_pkg.get("files_to_modify") or ["-"])[0] if current_pkg else "-"
-        _set_stage_status(display_state, "coder", "complete")
-        _set_stage_status(display_state, "validator", "running")
-        _set_stat(display_state, "Coder", "OK", f"Package {current}/{max(total, 1)} -- {first_file}")
-        _set_stat(display_state, "Validator", "RUNNING", "Running tests in sandbox...")
-        _set_activity(display_state, "Validator", "Running tests in sandbox...")
-        return
-
-    if node_name == "validator":
-        results = merged_state.get("package_results", [])
-        verdict = results[-1].get("status") if results else "UNKNOWN"
-        total = len(merged_state.get("work_packages", []))
-        current = min(int(merged_state.get("current_package_index", 0)) + 1, max(total, 1))
-
-        if verdict in ("PASS", "PASS_NO_TESTS"):
-            _set_stage_status(display_state, "validator", "complete")
-            _set_stat(display_state, "Validator", "OK", f"{verdict} -- package {current}/{max(total, 1)}")
-            _set_activity(display_state, "Validator", f"{verdict} -- committing package {current}...")
-            return
-
-        retry_count = int(merged_state.get("retry_count", 0)) + 1
-        if verdict in ("FAIL_COMPILE", "FAIL_TEST") and retry_count <= max_retries:
-            _set_stage_status(display_state, "validator", "failed")
-            _set_stage_status(display_state, "coder", "retrying", retry=retry_count)
-            _set_stat(display_state, "Validator", "FAIL", f"{verdict} -- retrying")
-            _set_stat(display_state, "Coder", "RUNNING", f"Retry {retry_count}/{max_retries} for package {current}")
-            _set_activity(display_state, "Coder", f"Retry {retry_count}/{max_retries} -- regenerating package {current}...")
-        else:
-            _set_stage_status(display_state, "validator", "failed")
-            _set_stage_status(display_state, "coder", "failed")
-            _set_stat(display_state, "Validator", "FAIL", str(verdict))
-            _set_stat(display_state, "Coder", "FAIL", f"Retries exhausted for package {current}")
-            _set_activity(display_state, "Validator", f"{verdict} -- retries exhausted")
-        return
-
-    if node_name in ("advance_package", "abort_package"):
-        total = len(merged_state.get("work_packages", []))
-        idx = int(merged_state.get("current_package_index", 0))
-        if node_name == "abort_package":
-            _set_stat(display_state, "Validator", "FAIL", "ABORTED -- max retries exhausted")
-        if idx < total:
-            _set_stage_status(display_state, "validator", "complete")
+        try:
+            display_state["stage_times"]["planner"]["end"] = now
+        except Exception:
+            pass
+        if not display_state.get("is_dry_run", False):
+            # Start coder
+            display_state["stage_coder"] = "running"
             _set_stage_status(display_state, "coder", "running")
-            next_file = (merged_state.get("work_packages", [])[idx].get("files_to_modify") or ["-"])[0]
-            _set_stat(display_state, "Coder", "RUNNING", f"Package {idx + 1}/{total} -- {next_file}")
-            _set_activity(display_state, "Coder", f"Package {idx + 1}/{total} -- Patching {next_file}...")
-        else:
-            _set_stage_status(display_state, "pr_agent", "running")
-            _set_stat(display_state, "PR Agent", "RUNNING", "Generating commit messages...")
-            _set_activity(display_state, "PR Agent", "Generating commit messages...")
-        return
+            display_state["current_activity"] = "Coder generating patches..."
 
-    if node_name == "pr_agent":
-        _set_stage_status(display_state, "pr_agent", "complete")
-        pr_number = merged_state.get("pr_number")
-        finding = f"PR #{pr_number}" if pr_number else "PR #unknown"
-        _set_stat(display_state, "PR Agent", "OK", finding)
-        _set_activity(display_state, "PR Agent", "Opening pull request... complete")
+    # Current patch (coder running)
+    if "current_patch" in update:
+        if not display_state.get("is_dry_run", False):
+            idx = int(update.get("current_package_index", 0))
+            total = len(update.get("work_packages", []))
+            pkgs = update.get("work_packages", []) or []
+            pkg = pkgs[idx] if 0 <= idx < len(pkgs) else {}
+            files = pkg.get("files_to_modify", []) if pkg else []
+            file_str = files[0] if files else "..."
+            display_state["coder_status"] = "RUNNING"
+            display_state["coder_detail"] = f"Package {idx+1}/{total} -- {file_str}"
+            if display_state.get("stage_coder") != "running":
+                display_state["stage_coder"] = "running"
+                try:
+                    display_state["stage_times"]["coder"]["start"] = now
+                    display_state["stage_times"]["coder"]["end"] = None
+                except Exception:
+                    pass
+
+    # Package results / validator
+    if "package_results" in update:
+        if not display_state.get("is_dry_run", False):
+            results = update.get("package_results", []) or []
+            passed = sum(1 for r in results if r.get("status") in ("PASS", "PASS_NO_TESTS"))
+            failed = sum(1 for r in results if r.get("status") in ("FAIL_COMPILE", "FAIL_TEST", "ABORTED"))
+            last = results[-1] if results else {}
+            verdict = last.get("status", "")
+            if verdict in ("PASS", "PASS_NO_TESTS"):
+                display_state["validator_status"] = "OK"
+                display_state["validator_detail"] = verdict
+                display_state["coder_status"] = "OK"
+                _set_stage_status(display_state, "validator", "complete")
+                _set_stage_status(display_state, "coder", "complete")
+                try:
+                    display_state["stage_times"]["validator"]["end"] = now
+                    display_state["stage_times"]["coder"]["end"] = now
+                except Exception:
+                    pass
+            elif verdict in ("FAIL_COMPILE", "FAIL_TEST"):
+                display_state["validator_status"] = "FAIL"
+                display_state["validator_detail"] = verdict
+                display_state["coder_status"] = "RETRYING"
+
+    # PR opened
+    if "pr_url" in update:
+        if not display_state.get("is_dry_run", False):
+            display_state["pr_agent_status"] = "OK"
+            pr_num = update.get("pr_number")
+            detail = f"PR #{pr_num}" if pr_num else "PR opened"
+            display_state["pr_agent_detail"] = detail
+            display_state["stage_pr_agent"] = "complete"
+            _set_stage_status(display_state, "pr_agent", "complete")
+            try:
+                display_state["stage_times"]["pr_agent"]["end"] = now
+            except Exception:
+                pass
+            # mark coder/validator complete as well
+            display_state["stage_coder"] = "complete"
+            display_state["stage_validator"] = "complete"
+            try:
+                display_state["stage_times"]["coder"]["end"] = now
+                display_state["stage_times"]["validator"]["end"] = now
+            except Exception:
+                pass
 
 
 async def _run_with_live(stream, max_retries: int, dry_run: bool = False) -> dict[str, Any]:
+    # Capture pipeline start so timers can use monotonic time.
+    pipeline_start_time = time.monotonic()
+
     display_state = _new_display_state(dry_run)
+    display_state["start_time"] = pipeline_start_time
     _set_stage_status(display_state, "scanner", "running")
     _set_activity(display_state, "Scanner", "Uploading repo to E2B sandbox...")
     _set_stat(display_state, "Scanner", "RUNNING", "Scanning repository...")
@@ -467,7 +789,20 @@ async def _run_with_live(stream, max_retries: int, dry_run: bool = False) -> dic
     final_state: dict[str, Any] = {}
     interrupted = False
 
-    done = asyncio.Event()
+    console.print()
+    display = TerminalDisplay(console)
+    stop_timer = threading.Event()
+
+    def _timer_loop() -> None:
+        while not stop_timer.is_set():
+            stop_timer.wait(timeout=1.0)
+            if stop_timer.is_set():
+                break
+            try:
+                dynamic = build_display_lines(display_state, pipeline_start_time)["dynamic"]
+                display.update_lines({1: dynamic[1], 3: dynamic[3]})
+            except Exception:
+                pass
 
     async def _consume_stream() -> None:
         nonlocal interrupted
@@ -478,32 +813,25 @@ async def _run_with_live(stream, max_retries: int, dry_run: bool = False) -> dic
                         continue
                     final_state.update(update)
                     _apply_event_update(display_state, node_name, final_state, update, max_retries)
+                try:
+                    result = build_display_lines(display_state, pipeline_start_time)
+                    display.full_render(result["lines"])
+                except Exception:
+                    pass
         except KeyboardInterrupt:
             interrupted = True
-        finally:
-            done.set()
+        except asyncio.CancelledError:
+            # Propagate cancellation to outer scope for centralized handling
+            raise
 
-    async def _force_refresh(live: Live, stop_event: asyncio.Event) -> None:
-        while not stop_event.is_set():
-            live.update(_build_renderables(display_state))
-            await asyncio.sleep(1.0)
-
-    consumer = asyncio.create_task(_consume_stream())
-
-    stop_refresh = asyncio.Event()
-    with Live(_build_renderables(display_state), console=console, refresh_per_second=2) as live:
-        refresh_task = asyncio.create_task(_force_refresh(live, stop_refresh))
-        try:
-            await done.wait()
-        finally:
-            stop_refresh.set()
-            refresh_task.cancel()
-            try:
-                await refresh_task
-            except asyncio.CancelledError:
-                pass
-
-    await consumer
+    timer_thread = threading.Thread(target=_timer_loop, daemon=True)
+    timer_thread.start()
+    try:
+        await _consume_stream()
+    finally:
+        stop_timer.set()
+        timer_thread.join(timeout=2.0)
+        display.clear()
 
     if interrupted:
         aclose = getattr(stream, "aclose", None)
@@ -520,8 +848,11 @@ def _print_plain_summary(final_state: dict[str, Any], elapsed_seconds: float, dr
     if dry_run:
         packages = final_state.get("work_packages", [])
         top_priority = packages[0].get("priority_label", "N/A") if packages else "N/A"
+        run_id = final_state.get("run_id")
         console.print()
         console.print("[bold cyan]Run complete[/bold cyan]")
+        if run_id:
+            console.print(f"  Run ID:             {run_id}")
         console.print(f"  Packages planned:   {len(packages)}")
         console.print(f"  Top priority:       {top_priority}")
         console.print("  No changes made to repo")
@@ -533,9 +864,12 @@ def _print_plain_summary(final_state: dict[str, Any], elapsed_seconds: float, dr
     passed = sum(1 for r in results if r.get("status") in ("PASS", "PASS_NO_TESTS"))
     failed = attempted - passed
     pr_url = final_state.get("pr_url")
+    run_id = final_state.get("run_id")
 
     console.print()
     console.print("[bold cyan]Run complete[/bold cyan]")
+    if run_id:
+        console.print(f"  Run ID:             {run_id}")
     console.print(f"  Packages attempted: {attempted}")
     console.print(f"  Packages passed:    [green]{passed}[/green]")
     console.print(f"  Packages failed:    [red]{failed}[/red]")
@@ -686,15 +1020,21 @@ def run(repo: str | None, dry_run: bool, config_path: str | None, clone_dir: str
         raise SystemExit(1)
 
     if dry_run:
+        # Install SIGINT handler so Ctrl+C cancels asyncio tasks immediately.
+        signal.signal(signal.SIGINT, _handle_sigint)
         try:
             asyncio.run(_run_dry(resolved_repo_path))
-        except KeyboardInterrupt:
-            console.print("Run interrupted")
+        finally:
+            # Restore default SIGINT handling so post-run behavior is normal.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
     else:
+        # Install SIGINT handler so Ctrl+C cancels asyncio tasks immediately.
+        signal.signal(signal.SIGINT, _handle_sigint)
         try:
             asyncio.run(_run_full(resolved_repo_path))
-        except KeyboardInterrupt:
-            console.print("Run interrupted")
+        finally:
+            # Restore default SIGINT handling so post-run behavior is normal.
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 @cli.command()
@@ -893,11 +1233,22 @@ async def _run_full(repo_path: str) -> None:
     console.print(f"[bold]Starting Reposition pipeline for:[/bold] {repo_path}\n")
     stream = run_pipeline(repo_path)
     started = time.monotonic()
+    final_state: dict[str, Any] | None = None
     try:
         final_state = await _run_with_live(stream, max_retries=cfg.coder.max_retries, dry_run=False)
         _print_plain_summary(final_state, time.monotonic() - started, dry_run=False)
+    except asyncio.CancelledError:
+        console.print()
+        console.print("[yellow]Run interrupted.[/yellow]")
+        rid = final_state.get("run_id") if final_state else "(unknown)"
+        console.print(f"[dim]Resume with: reposition resume {rid}[/dim]")
+        sys.exit(0)
     except KeyboardInterrupt:
-        console.print("Run interrupted")
+        console.print()
+        console.print("[yellow]Run interrupted.[/yellow]")
+        rid = final_state.get("run_id") if final_state else "(unknown)"
+        console.print(f"[dim]Resume with: reposition resume {rid}[/dim]")
+        sys.exit(0)
     except Exception:
         console.print(f"[red]{traceback.format_exc()}[/red]")
         raise SystemExit(1)
@@ -915,6 +1266,7 @@ async def _run_dry(repo_path: str) -> None:
 
     cfg = get_config()
     state = make_initial_state(repo_path)
+    run_id = state.get("run_id")
 
     trace_dir = Path(".traces")
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -922,38 +1274,78 @@ async def _run_dry(repo_path: str) -> None:
     RunTracer(state["run_id"], state["trace_path"])
 
     display_state = _new_display_state(dry_run=True)
+    # Ensure display knows this is a dry run before any pipeline execution begins.
+    display_state["is_dry_run"] = True
+    display_state["dry_run"] = True
     _set_stage_status(display_state, "scanner", "running")
     _set_activity(display_state, "Scanner", "Uploading repo to E2B sandbox...")
     _set_stat(display_state, "Scanner", "RUNNING", "Scanning repository...")
 
+    if run_id:
+        console.print(f"[dim]Run ID:  {run_id}[/dim]")
+        console.print(f"[dim]Status:  reposition status {run_id}[/dim]")
+        console.print()
+
     console.print(f"[bold]Starting Reposition dry run for:[/bold] {repo_path}\n")
     started = time.monotonic()
 
+    console.print()
+    display = TerminalDisplay(console)
+    pipeline_start_time = started
+    stop_timer = threading.Event()
+
+    def _timer_loop() -> None:
+        while not stop_timer.is_set():
+            stop_timer.wait(timeout=1.0)
+            if stop_timer.is_set():
+                break
+            try:
+                dynamic = build_display_lines(display_state, pipeline_start_time)["dynamic"]
+                display.update_lines({1: dynamic[1], 3: dynamic[3]})
+            except Exception:
+                pass
+
+    timer_thread = threading.Thread(target=_timer_loop, daemon=True)
+    timer_thread.start()
+
     interrupted = False
     try:
-        with Live(_build_renderables(display_state), console=console, refresh_per_second=2) as live:
-            try:
-                scanner_update = await scanner_agent(state)
-                state.update(scanner_update)
-                _apply_event_update(display_state, "scanner", state, scanner_update, cfg.coder.max_retries)
-                live.update(_build_renderables(display_state))
+        try:
+            scanner_update = await scanner_agent(state)
+            state.update(scanner_update)
+            _apply_event_update(display_state, "scanner", state, scanner_update, cfg.coder.max_retries)
+            result = build_display_lines(display_state, pipeline_start_time)
+            display.full_render(result["lines"])
 
-                analyzer_update = await run_analyzers_parallel(state)
-                state.update(analyzer_update)
-                _apply_event_update(display_state, "analyzers", state, analyzer_update, cfg.coder.max_retries)
-                live.update(_build_renderables(display_state))
+            analyzer_update = await run_analyzers_parallel(state)
+            state.update(analyzer_update)
+            _apply_event_update(display_state, "analyzers", state, analyzer_update, cfg.coder.max_retries)
+            result = build_display_lines(display_state, pipeline_start_time)
+            display.full_render(result["lines"])
 
-                planner_update = await planner_agent(state)
-                state.update(planner_update)
-                _apply_event_update(display_state, "planner", state, planner_update, cfg.coder.max_retries)
-            except KeyboardInterrupt:
-                interrupted = True
+            planner_update = await planner_agent(state)
+            state.update(planner_update)
+            _apply_event_update(display_state, "planner", state, planner_update, cfg.coder.max_retries)
+            result = build_display_lines(display_state, pipeline_start_time)
+            display.full_render(result["lines"])
+        except KeyboardInterrupt:
+            interrupted = True
+    except asyncio.CancelledError:
+        interrupted = True
     except Exception:
         console.print(f"[red]{traceback.format_exc()}[/red]")
         raise SystemExit(1)
+    finally:
+        stop_timer.set()
+        timer_thread.join(timeout=2.0)
+        display.clear()
 
     if interrupted:
-        console.print("Run interrupted")
+        console.print()
+        console.print("[yellow]Run interrupted.[/yellow]")
+        if run_id:
+            console.print(f"[dim]Resume with: reposition resume {run_id}[/dim]")
+        return
 
     _print_plain_summary(state, time.monotonic() - started, dry_run=True)
 
@@ -974,7 +1366,12 @@ async def _run_dry(repo_path: str) -> None:
 @click.argument("run_id")
 def resume(run_id: str) -> None:
     """Resume a pipeline from its last checkpoint."""
-    asyncio.run(_resume(run_id))
+    # Install SIGINT handler so Ctrl+C cancels asyncio tasks immediately.
+    signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        asyncio.run(_resume(run_id))
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 async def _resume(run_id: str) -> None:
@@ -990,8 +1387,16 @@ async def _resume(run_id: str) -> None:
     except FileNotFoundError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         sys.exit(1)
+    except asyncio.CancelledError:
+        console.print()
+        console.print("[yellow]Run interrupted.[/yellow]")
+        console.print(f"[dim]Resume with: reposition resume {run_id}[/dim]")
+        sys.exit(0)
     except KeyboardInterrupt:
-        console.print("Run interrupted")
+        console.print()
+        console.print("[yellow]Run interrupted.[/yellow]")
+        console.print(f"[dim]Resume with: reposition resume {run_id}[/dim]")
+        sys.exit(0)
     except Exception:
         console.print(f"[red]{traceback.format_exc()}[/red]")
         raise SystemExit(1)

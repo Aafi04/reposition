@@ -119,25 +119,50 @@ async def run_analyzers_parallel(state: RepositionState) -> dict:
                 },
             }
 
-    security_task = _run_with_timeout(
-        security_analyzer_agent(state), "security_report", "security",
-    )
-    refactor_task = _run_with_timeout(
-        refactor_analyzer_agent(state), "refactor_report", "refactor",
-    )
-    coverage_task = _run_with_timeout(
-        coverage_analyzer_agent(state), "coverage_report", "coverage",
-    )
+    # Create tasks so we can cancel them explicitly on interrupt.
+    tasks = [
+        asyncio.create_task(_run_with_timeout(security_analyzer_agent(state), "security_report", "security")),
+        asyncio.create_task(_run_with_timeout(refactor_analyzer_agent(state), "refactor_report", "refactor")),
+        asyncio.create_task(_run_with_timeout(coverage_analyzer_agent(state), "coverage_report", "coverage")),
+    ]
 
-    results = await asyncio.gather(security_task, refactor_task, coverage_task)
+    keys = [
+        ("security_report", "security"),
+        ("refactor_report", "refactor"),
+        ("coverage_report", "coverage"),
+    ]
+
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Cancel all running tasks immediately and wait for them to finish cancelling.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     # Merge all result dicts; analyzer_statuses are merged key-by-key.
     merged: dict = {}
     merged_statuses: dict[str, str] = dict(state["analyzer_statuses"])
-    for result in results:
+
+    for idx, res in enumerate(results):
+        report_key, status_key = keys[idx]
+        if isinstance(res, Exception):
+            # Treat exceptions like an errored analyzer: empty report + ERROR status.
+            result = {
+                report_key: [],
+                "analyzer_statuses": {
+                    **state["analyzer_statuses"],
+                    status_key: "ERROR",
+                },
+            }
+        else:
+            result = res or {}
+
         statuses = result.pop("analyzer_statuses", {})
         merged_statuses.update(statuses)
         merged.update(result)
+
     merged["analyzer_statuses"] = merged_statuses
 
     return merged
@@ -451,12 +476,16 @@ async def run_pipeline(
         sandbox_id: str | None = None
 
         try:
-            async for event in graph.astream(state, config=config):
-                # event is {node_name: state_update_dict}
-                for node_name, update in event.items():
-                    if isinstance(update, dict) and "e2b_sandbox_id" in update:
-                        sandbox_id = update["e2b_sandbox_id"]
-                yield event
+            try:
+                async for event in graph.astream(state, config=config):
+                    # event is {node_name: state_update_dict}
+                    for node_name, update in event.items():
+                        if isinstance(update, dict) and "e2b_sandbox_id" in update:
+                            sandbox_id = update["e2b_sandbox_id"]
+                    yield event
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Allow cancellation/interrupt to propagate to caller for centralized handling
+                raise
         finally:
             if sandbox_id:
                 try:
