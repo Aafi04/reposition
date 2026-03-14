@@ -81,19 +81,22 @@ Priority order is always: `CRITICAL_SECURITY → HIGH_SECURITY → BUILD_RUNTIME
 
 ## Quickstart
 
-#### macOS / Linux
-
+### macOS and Linux
 ```bash
 git clone https://github.com/Aafi04/reposition
 cd reposition
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 reposition setup
+reposition run https://github.com/you/your-repo --dry-run
 ```
 
-`pip install -e .` installs Reposition and all provider SDK dependencies up front.
+> **Ubuntu/Debian:** If venv creation fails, first run:
+> `sudo apt install python3-venv python3-pip -y`
+> Then retry from `python3 -m venv .venv`.
 
-#### Windows
-
+### Windows
 ```powershell
 git clone https://github.com/Aafi04/reposition
 cd reposition
@@ -101,42 +104,59 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
 reposition setup
+reposition run https://github.com/you/your-repo --dry-run
 ```
 
-After activating the venv, all reposition commands
-work normally:
+> First install takes 3–5 minutes while dependencies
+> download. WSL users: clone to `~/` instead of
+> `/mnt/c/` for faster install times.
 
-```powershell
-reposition run https://github.com/owner/repo --dry-run
+### What `reposition setup` does
+
+The setup wizard runs once and configures everything:
+
+1. Asks which LLM provider you want to use
+2. Prints the exact URL to get your API key
+3. Collects your API key, E2B key, and GitHub token
+   (all input is masked — keys never appear on screen)
+4. Writes your `.env` file automatically
+5. Runs 5 verification checks to confirm everything
+   works before you run against a real repo
+
+After setup, you never need to touch a config file.
+
+### Getting your keys
+
+| Key | Where to get it | Free tier? |
+|-----|----------------|------------|
+| LLM API key | Depends on provider — setup tells you the URL | Gemini yes, Groq yes |
+| E2B_API_KEY | [e2b.dev/dashboard](https://e2b.dev/dashboard) | Yes |
+| GITHUB_TOKEN | [github.com/settings/tokens](https://github.com/settings/tokens) (repo scope) | Yes |
+
+You only need **one** LLM API key — whichever
+provider you choose during setup.
+
+### Running Reposition
+```bash
+# Preview what will change — no code written (~3-5 min)
+reposition run https://github.com/you/your-repo --dry-run
+
+# Full run — scans, fixes, validates, opens PR (~8-14 min)
+reposition run https://github.com/you/your-repo
+
+# All repo formats are accepted
+reposition run owner/repo
 reposition run https://github.com/owner/repo
+reposition run git@github.com:owner/repo.git
+
+# Open PR on a different repo (e.g. your fork)
 reposition run https://github.com/owner/repo --pr-repo you/fork
+
+# Resume an interrupted run
+reposition resume <run_id>
+
+# Check run status (run ID shown at pipeline start)
 reposition status <run_id>
-```
-
-| Setting        | Purpose                                                      |
-| -------------- | ------------------------------------------------------------ |
-| GITHUB_TOKEN   | GitHub personal access token (repo scope)                    |
-| --pr-repo flag | (Optional) Repo to open PRs on - defaults to analysis target |
-
-If you prefer not to use a venv, this also works
-on any platform:
-
-```bash
-python -m reposition setup
-python -m reposition run https://github.com/owner/repo --dry-run
-```
-
-Run examples:
-
-```bash
-# Analyze any repo
-reposition run https://github.com/owner/repo --dry-run
-
-# Full run — opens PR on the target repo
-reposition run https://github.com/owner/repo
-
-# Open PR on your fork instead
-reposition run https://github.com/owner/repo --pr-repo you/fork
 ```
 
 ---

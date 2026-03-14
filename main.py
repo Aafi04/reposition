@@ -22,7 +22,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-console = Console()
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+console = Console(legacy_windows=False)
 _logo_shown = False
 
 LOGO = """
@@ -127,13 +134,10 @@ def _env_has_values(env_path: Path) -> bool:
     return False
 
 
-def _prompt_secret(prompt: str, *, visible: bool = False) -> str:
-    """Prompt for a secret with optional visible mode and re-entry support."""
+def _prompt_secret(prompt: str) -> str:
+    """Prompt for a secret with masking and re-entry support."""
     while True:
-        if visible:
-            value = input(prompt).strip()
-        else:
-            value = getpass.getpass(prompt).strip()
+        value = getpass.getpass(prompt).strip()
         print(f"Received {len(value)} characters.")
         retry = input("Press Enter to continue, or type r to re-enter: ").strip().lower()
         if retry != "r":
@@ -535,7 +539,12 @@ def cli() -> None:
     """Reposition - AI-powered repository improvement pipeline."""
     global _logo_shown
     if not _logo_shown:
-        console.print(LOGO)
+        try:
+            console.print(LOGO)
+        except UnicodeEncodeError:
+            print("Reposition")
+            print("autonomous code improvement agent")
+            print("github.com/Aafi04/reposition")
         _logo_shown = True
 
 
@@ -567,6 +576,29 @@ def run(repo: str | None, dry_run: bool, config_path: str | None, clone_dir: str
 
     cfg = get_config()
     default_clone_root = cfg.github.clone_dir
+
+    # Preflight: fail fast when provider / key aren't configured, and avoid loading any LLMs.
+    provider_env = os.environ.get("REPOSITION_LLM_PROVIDER", "").strip().lower()
+    if not provider_env:
+        console.print("[red]Not configured.[/red] Run [cyan]reposition setup[/cyan] first.")
+        sys.exit(1)
+
+    provider = provider_env
+    env_key = _PROVIDER_OPTIONS.get(
+        next((k for k, v in _PROVIDER_OPTIONS.items() if v["slug"] == provider), -1),
+        {},
+    ).get("env_key")
+
+    api_key_present = False
+    if provider == "gemini":
+        api_key_present = bool(os.environ.get("GOOGLE_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip())
+    elif env_key:
+        api_key_present = bool(os.environ.get(env_key, "").strip())
+
+    if not api_key_present:
+        console.print(f"[red]Missing API key for '{provider}'.[/red]")
+        console.print("Run [cyan]reposition setup[/cyan] to reconfigure.")
+        sys.exit(1)
 
     normalized_analysis_repo: dict[str, str] | None = None
     if repo:
@@ -626,7 +658,7 @@ def run(repo: str | None, dry_run: bool, config_path: str | None, clone_dir: str
     if normalized_analysis_repo is not None:
         console.print(f"[bold]Clone destination:[/bold] {resolved_repo_path}")
 
-    if not _ensure_provider_dependency(cfg.llm.provider):
+    if not _ensure_provider_dependency(provider):
         console.print("[red]Configuration error:[/red] unable to install provider SDK.")
         raise SystemExit(1)
 
@@ -684,14 +716,9 @@ def setup() -> None:
 
     print(f"Get your key at: {provider_info['url']}")
 
-    show_values = input("Show key/token input while typing? [y/N]: ").strip().lower() in ("y", "yes")
-
-    llm_api_key = _prompt_secret(f"Paste your {provider_name} API key: ", visible=show_values)
-    e2b_api_key = _prompt_secret("Paste your E2B API key (free at e2b.dev/dashboard): ", visible=show_values)
-    github_token = _prompt_secret(
-        "Paste your GitHub token (github.com/settings/tokens, repo scope): ",
-        visible=show_values,
-    )
+    llm_api_key = _prompt_secret(f"Paste your {provider_name} API key: ")
+    e2b_api_key = _prompt_secret("Paste your E2B API key (free at e2b.dev/dashboard): ")
+    github_token = _prompt_secret("Paste your GitHub token (github.com/settings/tokens, repo scope): ")
 
     env_contents = (
         f"REPOSITION_LLM_PROVIDER={provider_slug}\n"
@@ -716,13 +743,114 @@ def setup() -> None:
     print("Verifying configuration...")
     print("")
 
-    check_script = project_root / "scripts" / "test_provider.py"
-    result = subprocess.run(
-        [sys.executable, str(check_script), "--provider", provider_slug],
-        cwd=str(project_root),
-        check=False,
-    )
-    all_passed = result.returncode == 0
+    from reposition import llm_client
+    from reposition.llm_client import call_llm, get_llm, PROVIDER_DEFAULTS
+
+    llm_client._api_key_warning_shown = True
+
+    def _strip_fences(text: str) -> str:
+        raw = (text or "").strip()
+        if raw.startswith("```") and raw.endswith("```"):
+            body = raw.strip("`").strip()
+            if body.lower().startswith("json"):
+                body = body[4:].lstrip()
+            return body.strip()
+        return raw
+
+    def _api_key_ok(chosen: str) -> tuple[bool, str]:
+        if chosen == "gemini":
+            if os.environ.get("GOOGLE_API_KEY", "").strip():
+                return True, "GOOGLE_API_KEY"
+            if os.environ.get("GEMINI_API_KEY", "").strip():
+                return True, "GEMINI_API_KEY"
+            return False, "GEMINI_API_KEY or GOOGLE_API_KEY"
+        key = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "groq": "GROQ_API_KEY"}.get(chosen, "")
+        return (bool(os.environ.get(key, "").strip()), key or "API key")
+
+    def _model_name(llm: object, fallback: str) -> str:
+        for attr in ("model_name", "model"):
+            value = getattr(llm, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return fallback
+
+    chosen = provider_slug
+    print(f"Testing provider: {chosen}")
+
+    check1_ok, key_label = _api_key_ok(chosen)
+    if check1_ok:
+        print(f"[PASS] CHECK 1 - API key present ({key_label})")
+    else:
+        print(f"[FAIL] CHECK 1 - API key present ({key_label} missing)")
+
+    check2_ok = False
+    check3_ok = False
+    check4_ok = False
+    check5_ok = False
+    token_usage_4: dict = {}
+
+    if check1_ok:
+        default_fast = PROVIDER_DEFAULTS[chosen]["fast"]
+        try:
+            llm_fast = get_llm("fast")
+            fast_model = _model_name(llm_fast, default_fast)
+            text, _ = call_llm(llm_fast, "You are a test bot.", "Respond with exactly: PONG")
+            if "PONG" in str(text).upper():
+                check2_ok = True
+                print(f"[PASS] CHECK 2 - Fast model connectivity ({fast_model})")
+            else:
+                print(f"[FAIL] CHECK 2 - Fast model connectivity ({fast_model})")
+                print(f"Response did not contain PONG: {text!r}")
+        except Exception as exc:
+            print(f"[FAIL] CHECK 2 - Fast model connectivity ({default_fast})")
+            print(f"Exception: {exc}")
+    else:
+        print("[FAIL] CHECK 2 - Fast model connectivity (skipped: API key missing)")
+
+    if check1_ok:
+        default_heavy = PROVIDER_DEFAULTS[chosen]["heavy"]
+        try:
+            llm_heavy = get_llm("heavy")
+            heavy_model = _model_name(llm_heavy, default_heavy)
+            text, _ = call_llm(llm_heavy, "You are a test bot.", "Respond with exactly: PONG")
+            if "PONG" in str(text).upper():
+                check3_ok = True
+                print(f"[PASS] CHECK 3 - Heavy model connectivity ({heavy_model})")
+            else:
+                print(f"[FAIL] CHECK 3 - Heavy model connectivity ({heavy_model})")
+                print(f"Response did not contain PONG: {text!r}")
+        except Exception as exc:
+            print(f"[FAIL] CHECK 3 - Heavy model connectivity ({default_heavy})")
+            print(f"Exception: {exc}")
+    else:
+        print("[FAIL] CHECK 3 - Heavy model connectivity (skipped: API key missing)")
+
+    if check1_ok:
+        try:
+            system = "You are a JSON API. Respond with valid JSON only. No markdown, no extra text."
+            user = "Return: {\"status\": \"ok\"}"
+            text, token_usage_4 = call_llm(get_llm("fast"), system, user)
+            parsed = json.loads(_strip_fences(str(text)))
+            if isinstance(parsed, dict) and parsed.get("status") == "ok":
+                check4_ok = True
+                print("[PASS] CHECK 4 - JSON output reliability")
+            else:
+                print("[FAIL] CHECK 4 - JSON output reliability")
+                print(f"Raw response failed validation: {text}")
+        except Exception:
+            print("[FAIL] CHECK 4 - JSON output reliability")
+            print(f"Raw response failed to parse: {locals().get('text', '')}")
+    else:
+        print("[FAIL] CHECK 4 - JSON output reliability (skipped: API key missing)")
+
+    if token_usage_4 and len(token_usage_4.keys()) > 0:
+        check5_ok = True
+        print("[PASS] CHECK 5 - Token usage reporting")
+    else:
+        print("[WARN] CHECK 5 - Token usage reporting")
+        print("Token usage not reported by this provider -- tracer token counts will show 0")
+
+    all_passed = check1_ok and check2_ok and check3_ok and check4_ok
 
     if all_passed:
         print("")
